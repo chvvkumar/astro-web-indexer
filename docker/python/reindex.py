@@ -11,6 +11,7 @@ import argparse
 from io import BytesIO
 import logging
 from datetime import datetime
+import math
 
 # Configure logging
 logging.basicConfig(
@@ -62,16 +63,209 @@ def calculate_hash(filepath, block_size=65536):
             hasher.update(buf)
     return hasher.hexdigest()
 
-# --- Thumbnail function ---
-def make_thumbnail(data, size):
+# --- Get stretch settings for a folder ---
+def get_folder_stretch_settings(conn, cur, folder_path):
+    """
+    Find the most specific stretch settings for a given folder path.
+    Considers the 'apply_to_subfolders' flag to determine which settings to use.
+    """
+    path_parts = folder_path.strip('/').split('/')
+    # Build a list of parent paths to check, from most specific to least specific
+    paths_to_check = ['/']  # Root path is always checked
+    current_path = ''
+    for part in path_parts:
+        if current_path:
+            current_path += '/' + part
+        else:
+            current_path = part
+        paths_to_check.insert(0, '/' + current_path)  # Insert at beginning to check most specific first
+    
+    # Format the SQL placeholders for the IN clause
+    placeholders = ', '.join(['%s'] * len(paths_to_check))
+    
+    # Query for matching folder paths that have apply_to_subfolders=1, ordered from most specific to least specific
+    query = f"""
+        SELECT * FROM folder_stretch_settings 
+        WHERE folder_path IN ({placeholders}) 
+        AND (apply_to_subfolders = 1 OR folder_path = %s)
+        ORDER BY LENGTH(folder_path) DESC
+        LIMIT 1
+    """
+    
+    # Add the exact folder path as the last parameter for the exact match check
+    params = paths_to_check + ['/' + folder_path.strip('/') if folder_path else '/']
+    
     try:
-        data = np.nan_to_num(data)
-        p_low, p_high = np.nanpercentile(data, [0.5, 99.5])
+        cur.execute(query, params)
+        settings = cur.fetchone()
+        if settings:
+            return settings
+        else:
+            # If no settings found, return default values
+            return {
+                'stretch_type': 'linear',
+                'linear_low_percent': 0.5,
+                'linear_high_percent': 99.5,
+                'stf_shadow_clip': 0.0,
+                'stf_highlight_clip': 0.0,
+                'stf_midtones_balance': 0.5,
+                'stf_strength': 1.0,
+                'apply_to_subfolders': 1
+            }
+    except mysql.connector.Error as err:
+        logger.error(f"Error retrieving stretch settings: {err}")
+        # Return default values in case of error
+        return {
+            'stretch_type': 'linear',
+            'linear_low_percent': 0.5,
+            'linear_high_percent': 99.5,
+            'stf_shadow_clip': 0.0,
+            'stf_highlight_clip': 0.0,
+            'stf_midtones_balance': 0.5,
+            'stf_strength': 1.0,
+            'apply_to_subfolders': 1
+        }
+
+# --- PixInsight STF algorithm implementation ---
+def pixinsight_stf_stretch(data, shadow_clip=0.0, highlight_clip=0.0, midtones_balance=0.5, strength=1.0):
+    """
+    Implements PixInsight's ScreenTransferFunction (STF) algorithm for non-linear image stretching.
+    
+    Parameters:
+    -----------
+    data : ndarray
+        Input image data
+    shadow_clip : float
+        Shadow clipping point (0.0-1.0)
+    highlight_clip : float
+        Highlight clipping point (0.0-1.0)
+    midtones_balance : float
+        Midtones balance factor (0.0-1.0)
+    strength : float
+        The strength of the stretch effect (typically 1.0)
+        
+    Returns:
+    --------
+    ndarray
+        Stretched image data (0.0-1.0 range)
+    """
+    try:
+        # Normalize data to 0-1 range using percentiles
+        data_min = np.nanmin(data)
+        data_max = np.nanmax(data)
+        
+        if data_max <= data_min:
+            return np.zeros_like(data)
+        
+        # Initial normalization to 0-1 range
+        normalized = (data - data_min) / (data_max - data_min)
+        
+        # Apply shadow and highlight clipping
+        if shadow_clip > 0.0 or highlight_clip > 0.0:
+            shadow_val = shadow_clip
+            highlight_val = 1.0 - highlight_clip
+            
+            # Rescale the normalized values
+            if highlight_val > shadow_val:
+                normalized = (normalized - shadow_val) / (highlight_val - shadow_val)
+                normalized = np.clip(normalized, 0.0, 1.0)
+            else:
+                # Invalid shadow/highlight values
+                return np.zeros_like(data)
+        
+        # Apply midtones transformation (MTF)
+        if midtones_balance != 0.5:
+            # Adjust midtones using a power function with variable gamma
+            if midtones_balance < 0.5:
+                # Darker midtones
+                gamma = 1.0 + 9.0 * (0.5 - midtones_balance)
+            else:
+                # Lighter midtones
+                gamma = 1.0 / (1.0 + 9.0 * (midtones_balance - 0.5))
+            
+            # Apply gamma correction
+            normalized = np.power(normalized, gamma)
+        
+        # Apply strength factor if not 1.0
+        if strength != 1.0:
+            # Strength adjusts how intense the effect is
+            # For values < 1.0, we blend with the original normalized data
+            if strength < 1.0:
+                orig_normalized = (data - data_min) / (data_max - data_min)
+                normalized = strength * normalized + (1.0 - strength) * orig_normalized
+            # For values > 1.0, we enhance the effect (be careful with this)
+            else:
+                # A simple way to enhance is to apply an additional power function
+                normalized = np.power(normalized, 1.0 / strength)
+        
+        return normalized
+    
+    except Exception as e:
+        logger.warning(f"PixInsight STF stretch failed: {e}")
+        # Fallback to simple linear stretch
+        return linear_stretch(data, 0.5, 99.5)
+
+# --- Linear stretch function ---
+def linear_stretch(data, low_percent=0.5, high_percent=99.5):
+    """
+    Simple linear stretch using percentile clipping.
+    
+    Parameters:
+    -----------
+    data : ndarray
+        Input image data
+    low_percent : float
+        Lower percentile for clipping
+    high_percent : float
+        Upper percentile for clipping
+        
+    Returns:
+    --------
+    ndarray
+        Stretched image data (0.0-1.0 range)
+    """
+    try:
+        p_low, p_high = np.nanpercentile(data, [low_percent, high_percent])
         if p_high <= p_low:
-            stretched = np.zeros_like(data, dtype=float)
+            return np.zeros_like(data, dtype=float)
         else:
             stretched = (data - p_low) / (p_high - p_low)
-        stretched = np.clip(stretched, 0, 1)
+            return np.clip(stretched, 0, 1)
+    except Exception as e:
+        logger.warning(f"Linear stretch failed: {e}")
+        return np.zeros_like(data, dtype=float)
+
+# --- Thumbnail function ---
+def make_thumbnail(data, size, folder_path=None, conn=None, cur=None):
+    try:
+        data = np.nan_to_num(data)
+        
+        # Get stretch settings for this folder if conn and cur are provided
+        if conn and cur and folder_path:
+            settings = get_folder_stretch_settings(conn, cur, folder_path)
+            stretch_type = settings['stretch_type']
+            
+            if stretch_type == 'pixinsight_stf':
+                # Apply PixInsight STF algorithm
+                stretched = pixinsight_stf_stretch(
+                    data,
+                    shadow_clip=settings['stf_shadow_clip'],
+                    highlight_clip=settings['stf_highlight_clip'],
+                    midtones_balance=settings['stf_midtones_balance'],
+                    strength=settings['stf_strength']
+                )
+            else:
+                # Default to linear stretch with custom percentiles
+                stretched = linear_stretch(
+                    data,
+                    low_percent=settings['linear_low_percent'],
+                    high_percent=settings['linear_high_percent']
+                )
+        else:
+            # If no database connection or folder path, use default linear stretch
+            stretched = linear_stretch(data, 0.5, 99.5)
+        
+        # Convert to 8-bit image
         img = (stretched * 255).astype(np.uint8)
         image = Image.fromarray(img)
         image.thumbnail(size)
@@ -214,9 +408,10 @@ try:
             if not file_lower.endswith(('.fits', '.fit', '.xisf')):
                 continue
 
-            full_path = os.path.join(root, file)
-            rel_path = os.path.relpath(full_path, fits_root)
-            disk_files[rel_path] = True
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, fits_root)
+                folder_path = os.path.dirname(rel_path)
+                disk_files[rel_path] = True
 
             try:
                 stat = os.stat(full_path)
@@ -258,7 +453,7 @@ try:
                     if data.ndim > 2 and data.shape[0] < 5:
                         data = data[0]
                     if data.ndim >= 2:
-                        thumb = make_thumbnail(data, thumb_size)
+                        thumb = make_thumbnail(data, thumb_size, folder_path, conn, cur)
 
                 object_name = get_value(header, 'OBJECT', 'Unknown', str).strip()
                 date_obs_str = get_value(header, 'DATE-OBS', None, str)
@@ -380,4 +575,3 @@ except Exception as e:
 finally:
     if 'conn' in locals() and conn.is_connected():
         conn.close()
-
