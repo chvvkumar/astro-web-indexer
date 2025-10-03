@@ -69,6 +69,28 @@ def get_folder_stretch_settings(conn, cur, folder_path):
     Find the most specific stretch settings for a given folder path.
     Considers the 'apply_to_subfolders' flag to determine which settings to use.
     """
+    # Default values if nothing is found or there's an error
+    default_settings = {
+        'stretch_type': 'linear',
+        'linear_low_percent': 0.5,
+        'linear_high_percent': 99.5,
+        'stf_shadow_clip': 0.0,
+        'stf_highlight_clip': 0.0,
+        'stf_midtones_balance': 0.5,
+        'stf_strength': 1.0,
+        'apply_to_subfolders': 1
+    }
+
+    # Check if table exists first (for first-time runs)
+    try:
+        cur.execute("SHOW TABLES LIKE 'folder_stretch_settings'")
+        if not cur.fetchone():
+            logger.info("folder_stretch_settings table does not exist yet, using default settings")
+            return default_settings
+    except mysql.connector.Error as err:
+        logger.error(f"Error checking table existence: {err}")
+        return default_settings
+
     path_parts = folder_path.strip('/').split('/')
     # Build a list of parent paths to check, from most specific to least specific
     paths_to_check = ['/']  # Root path is always checked
@@ -85,7 +107,10 @@ def get_folder_stretch_settings(conn, cur, folder_path):
     
     # Query for matching folder paths that have apply_to_subfolders=1, ordered from most specific to least specific
     query = f"""
-        SELECT * FROM folder_stretch_settings 
+        SELECT stretch_type, linear_low_percent, linear_high_percent, 
+               stf_shadow_clip, stf_highlight_clip, stf_midtones_balance, 
+               stf_strength, apply_to_subfolders, folder_path
+        FROM folder_stretch_settings 
         WHERE folder_path IN ({placeholders}) 
         AND (apply_to_subfolders = 1 OR folder_path = %s)
         ORDER BY LENGTH(folder_path) DESC
@@ -97,34 +122,31 @@ def get_folder_stretch_settings(conn, cur, folder_path):
     
     try:
         cur.execute(query, params)
-        settings = cur.fetchone()
-        if settings:
+        row = cur.fetchone()
+        
+        if row:
+            # Map tuple values to keys
+            col_names = ['stretch_type', 'linear_low_percent', 'linear_high_percent', 
+                         'stf_shadow_clip', 'stf_highlight_clip', 'stf_midtones_balance', 
+                         'stf_strength', 'apply_to_subfolders', 'folder_path']
+            
+            # Create a dictionary with column names as keys
+            settings = {}
+            for i, name in enumerate(col_names):
+                if i < len(row):  # Safety check
+                    settings[name] = row[i]
+                else:
+                    # Use default if column not present
+                    settings[name] = default_settings.get(name)
+            
             return settings
         else:
             # If no settings found, return default values
-            return {
-                'stretch_type': 'linear',
-                'linear_low_percent': 0.5,
-                'linear_high_percent': 99.5,
-                'stf_shadow_clip': 0.0,
-                'stf_highlight_clip': 0.0,
-                'stf_midtones_balance': 0.5,
-                'stf_strength': 1.0,
-                'apply_to_subfolders': 1
-            }
+            return default_settings
     except mysql.connector.Error as err:
         logger.error(f"Error retrieving stretch settings: {err}")
         # Return default values in case of error
-        return {
-            'stretch_type': 'linear',
-            'linear_low_percent': 0.5,
-            'linear_high_percent': 99.5,
-            'stf_shadow_clip': 0.0,
-            'stf_highlight_clip': 0.0,
-            'stf_midtones_balance': 0.5,
-            'stf_strength': 1.0,
-            'apply_to_subfolders': 1
-        }
+        return default_settings
 
 # --- PixInsight STF algorithm implementation ---
 def pixinsight_stf_stretch(data, shadow_clip=0.0, highlight_clip=0.0, midtones_balance=0.5, strength=1.0):
@@ -382,8 +404,47 @@ def get_xisf_header_value(header, key, default=None, type_func=None):
 # --- Main execution ---
 try:
     logger.info(f"Connecting to database {args.database} on {args.host}")
-    conn = mysql.connector.connect(host=args.host, user=args.user, password=args.password, database=args.database)
+    conn = mysql.connector.connect(
+        host=args.host, 
+        user=args.user, 
+        password=args.password, 
+        database=args.database
+    )
     cur = conn.cursor()
+    
+    # Check and create the folder_stretch_settings table if it doesn't exist
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS folder_stretch_settings (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                folder_path VARCHAR(1024) NOT NULL,
+                stretch_type ENUM('linear', 'pixinsight_stf', 'custom') NOT NULL DEFAULT 'linear',
+                linear_low_percent FLOAT NOT NULL DEFAULT 0.5,
+                linear_high_percent FLOAT NOT NULL DEFAULT 99.5,
+                stf_shadow_clip FLOAT NOT NULL DEFAULT 0.0,
+                stf_highlight_clip FLOAT NOT NULL DEFAULT 0.0,
+                stf_midtones_balance FLOAT NOT NULL DEFAULT 0.5,
+                stf_strength FLOAT NOT NULL DEFAULT 1.0,
+                apply_to_subfolders TINYINT(1) NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE INDEX idx_folder_path (folder_path)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        
+        # Insert default values for root folder if not exists
+        cur.execute("""
+            INSERT IGNORE INTO folder_stretch_settings 
+                (folder_path, stretch_type, linear_low_percent, linear_high_percent, 
+                stf_shadow_clip, stf_highlight_clip, stf_midtones_balance, stf_strength, 
+                apply_to_subfolders)
+            VALUES
+                ('/', 'linear', 0.5, 99.5, 0.0, 0.0, 0.5, 1.0, 1)
+        """)
+        conn.commit()
+        logger.info("Folder stretch settings table checked/created")
+    except mysql.connector.Error as err:
+        logger.warning(f"Could not create folder_stretch_settings table: {err}")
 
     logger.info("Loading existing file data from database...")
     cur.execute("SELECT path, file_hash, mtime, file_size, deleted_at FROM files")
