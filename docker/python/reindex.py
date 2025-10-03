@@ -408,10 +408,10 @@ try:
             if not file_lower.endswith(('.fits', '.fit', '.xisf')):
                 continue
 
-                full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, fits_root)
-                folder_path = os.path.dirname(rel_path)
-                disk_files[rel_path] = True
+            full_path = os.path.join(root, file)
+            rel_path = os.path.relpath(full_path, fits_root)
+            folder_path = os.path.dirname(rel_path)
+            disk_files[rel_path] = True
 
             try:
                 stat = os.stat(full_path)
